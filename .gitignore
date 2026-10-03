@@ -1,0 +1,29 @@
+# Build output
+target/
+build/
+bin/
+out/
+*.class
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+
+# Coverage / test output
+jacoco*.exec
+*.log
+hs_err_pid*
+
+# IDEs and OS
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+.DS_Store
+
+# Local secrets (none are needed)
+.env
+.env.*
+
+# Tool caches
+.uv-cache/

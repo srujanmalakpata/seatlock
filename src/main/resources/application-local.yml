@@ -1,0 +1,7 @@
+# Local development only: the PostgreSQL started by `docker compose up -d postgres`.
+# Activate with `./mvnw spring-boot:run -Dspring-boot.run.profiles=local`.
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/seats}
+    username: ${DB_USER:seats}
+    password: ${DB_PASSWORD:seats}
