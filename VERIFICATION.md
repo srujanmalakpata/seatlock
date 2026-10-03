@@ -1,5 +1,7 @@
 # seatlock test record
 
+## Recorded Linux checks (2026-10-03)
+
 - Date: 2026-10-03
 - Environment: a shared 4-vCPU Linux container (x86_64, shared with other concurrent builds),
   OpenJDK 21.0.11, Maven 3.9.11 (also via `./mvnw`, wrapper 3.3.4), Docker Engine 29.6.2,
@@ -37,8 +39,8 @@
 | 20a | `ConcurrencyIT.parallelConfirmsOfOneHoldCreateExactlyOneBooking` (part of `./mvnw -B -ntp clean verify`, row 2) | PASS | 20 parallel confirms of one hold: exactly 1 booking created, 19 x 409; enforced by the test's assertions, which pass in the clean build |
 | 21 | Scheduled expiry in the container: `docker run --network seatlock_default -e SEATS_HOLDTTL=PT3S -e SEATS_EXPIRYSWEEPINTERVAL=PT1S ... seatlock:local`, hold one seat, wait 6 s | PASS | `expiresAt 02:47:28.218Z`; log `Expired 1 hold(s)` at `02:47:28.629Z`; `status after 6s: EXPIRED`; availability `"available":1,"held":0` |
 | 22 | `docker compose stop app` + `./mvnw spring-boot:run -Dspring-boot.run.profiles=local` | PASS | `The following 1 profile is active: "local"`; `Started SeatlockApplication in 11.287 seconds`; `/actuator/health` UP; `/swagger-ui.html` 302 (redirect to the UI); `/v3/api-docs` 9 paths |
-| 23 | GitHub Actions workflow on a real runner | NOT_RUN | The project has not been pushed. The workflow is validated as YAML only, and its steps match #1, #2, #16 and #17 |
-| 24 | Two application instances against one database | NOT_RUN | No two-instance setup is tested. Multi-instance safety is argued from the database-level locking, not tested |
+| 23 | GitHub Actions workflow on a real runner | NOT_RUN | No hosted run was verified during this Linux session; the workflow was validated as YAML and its steps match #1, #2, #16 and #17. See the README badge for hosted status |
+| 24 | Two application instances against one database | NOT_RUN | Not exercised in this Linux session; bounded hold/confirm checks were subsequently recorded in the Mac session below |
 | 25 | Mutation-check attempt during shared-container disk exhaustion | FAIL (environment, before tests) | PostgreSQL cannot initialise its data directory because the disk is full. No tests run in this attempt; mutation results in rows 7–12 are from completed attempts |
 
 ## Test inventory (from #2)
@@ -46,6 +48,8 @@
 Counts are test cases as Surefire/Failsafe report them. Two of the 111 test methods are
 parameterized (`SeatMapLayoutTest` has 6 methods that run 14 times, `SectionSpecTest` 3 methods
 that run 8 times), so 111 methods produce 124 test cases.
+`IdempotencyIT.concurrentRetriesWithOneKeyCreateOneHold` includes 20 simultaneous retries with
+one key and checks that exactly one hold is created; it is part of the 27 passing integration cases.
 
 | Class | Kind | Methods | Test cases |
 |---|---|---|---|
@@ -94,3 +98,55 @@ These checks are manual and are not part of CI.
 | A full batch of failing expired holds prevented later holds from expiring | Page due holds using a keyset cursor on `(expires_at, id)` | `HoldExpiryJobTest.aFullBatchOfFailingHoldsDoesNotBlockTheHoldsBehindIt`; dropping the cursor fails 4 of 6 tests (row 12) |
 | Negative section dimensions could offset a valid section's seat count and bypass the total-capacity check | Validate each `SectionSpec` in the domain, independently of request validation | `SectionSpecTest.negativeSectionCannotOffsetAnotherSectionInTheSeatLimit` |
 | A nanosecond event start could round past the test clock in PostgreSQL and allow a hold at the intended cut-off | Use whole-second timestamps in boundary fixtures, matching the database's microsecond precision | `ReservationFlowIT.seatsCannotBeHeldConfirmedOrCancelledOnceTheEventHasStarted` |
+
+## Recorded Mac checks (2026-10-02)
+
+These prior results are retained to clarify validation scope; they were not rerun in the local
+session below. Environment: macOS 27.0.1 arm64, OpenJDK 21.0.11, Maven 3.9.11, Colima 0.10.3,
+Docker Engine 29.5.2 and PostgreSQL 16.15. Timings were measured under parallel load.
+
+| Check | Result | Recorded output |
+|---|---|---|
+| Clean build, unit/slice tests and PostgreSQL integration tests | PASS | 124 cases, zero failures/errors/skips; 51.976 s wall time |
+| Merged JaCoCo coverage | PASS | Lines 758/778 = 97.4%; branches 170/192 = 88.5% |
+| Two native application instances sharing one PostgreSQL database: 50 contested holds | PASS | 1 × 201, 49 × 409; 172.898 ms wall time |
+| Same two instances: 20 parallel confirmations of one hold | PASS | 1 × 201, 19 × 409 |
+| Docker image build, Compose health/migrations, smoke, fail-fast DB/TTL configuration, scheduled expiry (later rerun with Buildx/Compose installed) | PASS | All six checks passed; Compose smoke ended `SMOKE TEST PASSED`; both services healthy, schema v2 |
+
+The two-instance checks cover only those hold and confirmation races. Multi-instance expiry,
+idempotency, restart and failover were not tested. Missing Docker plugins initially prevented
+container checks; the later rerun resolved that environment limitation. Process enumeration was
+blocked by sandbox permissions. No deployment or load test occurred.
+
+## Local recheck (2026-10-03)
+
+Environment: macOS 27.0.1 arm64, Temurin Java 21.0.12.1, Maven 3.9.11 via the wrapper,
+Docker CLI 29.8.1, Compose 5.6.0 and Buildx 0.37.2. Docker engine access is denied by the sandbox;
+its current version cannot be verified. No tools or runtime dependencies were installed.
+
+| Command / check | Result | Output and scope |
+|---|---|---|
+| `java -version`; `./mvnw -v` | PASS | Java 21.0.12.1; Apache Maven 3.9.11 |
+| `./mvnw -B -ntp spotless:check` | PASS | `BUILD SUCCESS`; 73 Java files clean (initial run and final recheck) |
+| Initial `./mvnw -B -ntp verify`, before the test JVM configuration fix | BLOCKED | Exit 1: Mockito could not self-attach to the JVM; 97 unit/slice cases attempted, 45 initialization errors, no assertion failures. Replaced dynamic attachment with startup loading of the existing Mockito dependency |
+| `./mvnw -B -ntp test`, after the fix | PASS | `BUILD SUCCESS`; 97 cases, 0 failures, 0 errors, 0 skips |
+| `./mvnw -B -ntp verify`, after the fix | BLOCKED | Unit/slice cases: 97 passed; compilation and jar packaging succeeded. All 27 integration cases errored during PostgreSQL container initialization because Testcontainers could not find an accessible Docker socket; Maven exited 1 |
+| Same `verify` with `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock` and `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock` | BLOCKED | 97 unit/slice cases passed; Docker connection failed with `java.net.SocketException: Operation not permitted`; 27 integration initialization errors, Maven exit 1. No assertion was loosened or test skipped |
+| Current merged JaCoCo coverage report | NOT_RUN | Failsafe verification stopped before the report goal. The historical coverage percentages above are not new measurements |
+| `docker compose version`; `docker buildx version` | PASS | Compose 5.6.0; Buildx 0.37.2 |
+| `docker version` | BLOCKED | Client information printed; Docker socket connection denied |
+| `docker compose config --quiet` | PASS | Compose configuration validated, exit 0 |
+| `docker compose up --build --detach --wait --wait-timeout 180` | BLOCKED | Exit 1: permission denied connecting to the Colima Docker socket; no stack started |
+| `./scripts/smoke-test.sh http://localhost:8080` and README curl session against the Compose API | BLOCKED | Not executed against a live API because the required stack could not start |
+| `bash -n scripts/smoke-test.sh`; Bash syntax check of all README command blocks | PASS | Script and all four README Bash blocks parse; Quickstart contains five commands |
+| Local Markdown links and heading anchors; `pom.xml` XML parsing | PASS | Local targets and anchors resolve; XML is well formed |
+| Tracked build-output inventory; ignore-pattern check; `git diff --check` | PASS | No generated build/test/log artifacts tracked; existing ignore rules cover build outputs; no whitespace errors |
+| Maven property diagnostic (`help:evaluate -Dexpression=mockito.version`) | BLOCKED | Attempted to update metadata in the read-only Maven cache. The managed Mockito version was instead read from the cached Spring Boot dependency POM |
+| Hosted GitHub Actions run | NOT_RUN | No hosted status query, workflow trigger, commit or push performed in this session |
+
+The earlier Mac checks contained no failing application cases. The Linux disk-exhaustion attempt
+in row 25 was an environment failure before tests; completed mutation runs remain recorded in
+rows 7–12. This session fixed the observed Mockito startup problem without adding dependencies
+or changing test assertions. Full verification, Docker packaging, live curl and smoke checks still
+need an environment with Docker socket access. The project remains validated locally and never
+deployed; no production traffic or throughput benchmark is claimed.
