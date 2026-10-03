@@ -1,13 +1,174 @@
 # seatlock
 
-A Java 21 / Spring Boot 3 backend for event seat reservations with expiring holds, bookings and idempotent retries.
+A Java backend that reserves event seats with expiring holds, prevents double booking under contention, and replays idempotent retries.
 
-Clients create an event with a seat map, place a time-limited **hold** on seats, then **confirm**
-the hold into a booking (or let it expire). Concurrency tests check that when 50 clients
-grab the same seat at the same instant, exactly one wins, and when a client retries a timed-out
-request with the same `Idempotency-Key` it gets the original response back instead of a second
-booking. Optimistic locking (`@Version`), database constraints, and a scheduled expiry job enforce
-this. PostgreSQL integration tests run in Testcontainers and check it.
+[![CI](https://github.com/srujanmalakpata/seatlock/actions/workflows/ci.yml/badge.svg)](https://github.com/srujanmalakpata/seatlock/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Java 21](https://img.shields.io/badge/Java-21-orange.svg)](pom.xml)
+
+## Highlights
+
+- **One winner under contention:** 50 simultaneous holds on one seat yield 1 × 201 and 49 × 409;
+  `ConcurrencyIT.exactlyOneOfManyParallelHoldsForTheSameSeatWins` checks the database afterwards
+  ([verification, row 4](VERIFICATION.md#summary)).
+- **One booking under concurrent confirmation:** 20 confirms produce one booking and 19 × 409,
+  enforced by `ConcurrencyIT.parallelConfirmsOfOneHoldCreateExactlyOneBooking`
+  ([row 20a](VERIFICATION.md#summary)).
+- **Retries return the original response:** a PostgreSQL-backed idempotency filter replays status,
+  body and Location; `IdempotencyIT.concurrentRetriesWithOneKeyCreateOneHold` checks 20 concurrent
+  retries with one key ([test inventory](VERIFICATION.md#test-inventory-from-2)).
+- **Locking tested by removal:** removing either seat or hold `@Version` makes concurrency tests
+  fail; removing the expiry keyset cursor fails 4 of 6 expiry unit tests
+  ([mutation checks, rows 7–12](VERIFICATION.md#summary)).
+- **124 test cases against the real persistence model:** 97 unit/slice + 27 PostgreSQL integration
+  cases passed in the recorded Linux run, with 97.4% line coverage
+  ([rows 2–3](VERIFICATION.md#summary)).
+
+**Tech stack:** Java 21 · Spring Boot 3.5 · Spring Data JPA / Hibernate · PostgreSQL 16 · Flyway ·
+Testcontainers · JUnit 5 · JaCoCo · Micrometer / Prometheus · Docker Compose · Maven.
+
+Validated locally, never deployed; no real users or production traffic. The figures above are
+historical correctness checks, not load benchmarks. See the
+[current validation results](VERIFICATION.md#local-recheck-2026-10-03) for what was rerun and what
+this environment blocked.
+
+[Quickstart](#quickstart) · [Architecture](#architecture) · [Sample curl session](#sample-curl-session) ·
+[Features](#features) · [Configuration](#configuration) · [Testing](#testing) ·
+[Results](#results) · [Limitations](#limitations) · [Design rationale](DESIGN.md) · [License](#license)
+
+## Quickstart
+
+Requirements: Git, Docker with Compose and Buildx, a running Docker engine, curl and Python 3
+(for the smoke test). Ports 8080 and 5432 must be free. Java 21 is needed only for source builds;
+the container build supplies Java and Maven. The Maven wrapper downloads Maven 3.9.11.
+
+```bash
+git clone https://github.com/srujanmalakpata/seatlock.git
+cd seatlock
+docker compose up --build --detach --wait --wait-timeout 180
+curl -fsS http://localhost:8080/actuator/health
+./scripts/smoke-test.sh http://localhost:8080
+```
+
+Open [Swagger UI](http://localhost:8080/swagger-ui.html) to explore the API, or use the curl
+session below. Expected smoke output ends with `SMOKE TEST PASSED`. Stop the stack with
+`docker compose down` (keeps the database volume).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  C[HTTP client] --> F[IdempotencyFilter<br/>POST + Idempotency-Key]
+  F --> W[Controllers<br/>EventController / ReservationController]
+  W --> S[Services<br/>EventService / ReservationService]
+  S --> D[Domain entities<br/>Event, Seat, Hold, Booking<br/>state transitions + @Version]
+  S --> R[Spring Data JPA repositories]
+  F --> I[(idempotency_record)]
+  R --> P[(PostgreSQL<br/>Flyway schema)]
+  J[HoldExpiryJob<br/>@Scheduled] --> S
+  W -. errors .-> E[ApiExceptionHandler<br/>RFC 7807 problem+json]
+  A[Actuator + Micrometer] -. /actuator/prometheus .-> M[Prometheus]
+```
+
+### Hold → book, retry and expiry
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant A as API + idempotency filter
+  participant P as PostgreSQL
+  participant J as HoldExpiryJob
+  C->>A: POST /events/{id}/holds + key H
+  A->>P: Claim H (separate commit), then atomically hold seats with version checks
+  P-->>A: ACTIVE hold + expiresAt
+  A->>P: Store response for H
+  A-->>C: 201 + hold UUID
+  C->>A: Retry identical request + key H
+  A->>P: Read stored response for H
+  A-->>C: Same 201 + UUID, Idempotent-Replayed: true
+  alt Confirm before expiresAt and event start
+    C->>A: POST /holds/{id}/confirm + key B
+    A->>P: Claim B (separate commit), then atomically CONFIRMED + BOOKED + booking
+    A->>P: Store response for B
+    A-->>C: 201 + booking UUID
+    C->>A: Retry confirm + key B
+    A->>P: Read stored response for B
+    A-->>C: Same booking, Idempotent-Replayed: true
+  else Hold expires before confirmation
+    Note over A,P: New confirmation is rejected from expiresAt
+    J->>P: Read due ACTIVE holds using keyset pagination
+    J->>P: Per-hold transaction: EXPIRED + seats AVAILABLE
+    Note over J,P: Hold version rejects a stale expiry if confirm won
+  end
+```
+
+Response storage follows the business commit in a separate transaction; the crash window is
+documented under [Limitations](#limitations).
+
+```
+src/main/java/dev/seatlock/
+  domain/        entities + state machines (Seat, Hold, Booking, Event), SeatMapLayout, exceptions
+  repository/    Spring Data JPA interfaces (+ a JPQL availability aggregate, a Specification filter)
+  service/       EventService, ReservationService (transactions), HoldExpiryJob, metrics
+  web/           controllers, request/response records, ApiExceptionHandler (problem+json)
+  idempotency/   IdempotencyFilter, JDBC store (INSERT ... ON CONFLICT DO NOTHING), cleanup job
+  config/        typed properties (seats.*), Clock, scheduling switch, OpenAPI metadata
+src/main/resources/db/migration/   V1 schema, V2 (drop a redundant index, CHECK on booking totals)
+```
+
+Seat lifecycle: `AVAILABLE -> HELD -> BOOKED`, back to `AVAILABLE` on release, expiry or
+cancellation. Hold lifecycle: `ACTIVE -> CONFIRMED | RELEASED | EXPIRED`.
+
+Design rationale, alternatives and known gaps are in [DESIGN.md](DESIGN.md).
+
+## Sample curl session
+
+Run this block in Bash after Quickstart. Python extracts the returned UUIDs, creates fresh
+idempotency keys, and sets the event start to tomorrow. Complete confirmation before the
+hold's default five-minute TTL.
+
+```bash
+set -euo pipefail
+BASE_URL=http://localhost:8080
+json() { python3 -c "import json,sys; print(json.load(sys.stdin)$1)"; }
+EVENT_BODY=$(python3 - <<'PYTHON'
+import json
+from datetime import datetime, timedelta, timezone
+print(json.dumps({
+    "name": "Jazz Night", "venue": "Main Hall",
+    "startsAt": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+    "sections": [{"name": "FLOOR", "rows": 2, "seatsPerRow": 5, "priceCents": 5000}]
+}))
+PYTHON
+)
+EVENT_ID=$(curl -fsS -X POST "$BASE_URL/api/v1/events" \
+  -H 'Content-Type: application/json' -d "$EVENT_BODY" | json "['id']")
+SEAT_ID=$(curl -fsS "$BASE_URL/api/v1/events/$EVENT_ID/seats?status=AVAILABLE&size=1" \
+  | json "['items'][0]['id']")
+HOLD_KEY=$(python3 -c 'import uuid; print(uuid.uuid4())')
+HOLD_BODY="{\"seatIds\":[\"$SEAT_ID\"],\"customerRef\":\"cust-42\"}"
+HOLD_ID=$(curl -fsS -X POST "$BASE_URL/api/v1/events/$EVENT_ID/holds" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: $HOLD_KEY" \
+  -d "$HOLD_BODY" | json "['id']")
+
+# Retry the identical hold request: same hold UUID, Idempotent-Replayed: true.
+curl -fsS -i -X POST "$BASE_URL/api/v1/events/$EVENT_ID/holds" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: $HOLD_KEY" -d "$HOLD_BODY"
+
+# Confirm twice with one fresh key: both return the same booking UUID and HTTP 201.
+CONFIRM_KEY=$(python3 -c 'import uuid; print(uuid.uuid4())')
+for attempt in 1 2; do
+  curl -fsS -i -X POST "$BASE_URL/api/v1/holds/$HOLD_ID/confirm" \
+    -H "Idempotency-Key: $CONFIRM_KEY"
+done
+curl -fsS "$BASE_URL/api/v1/events/$EVENT_ID/availability"
+```
+
+The second confirmation includes `Idempotent-Replayed: true`; availability shows `booked: 1`,
+`held: 0`, `available: 9`. Without an idempotency key, confirming an already confirmed hold returns
+409. Reusing a key with a different request returns 422. A new confirmation after `expiresAt`
+returns 409 `hold-expired`, both before and after the sweep. A retry of a previously successful
+keyed confirmation still replays its booking.
 
 ## Features
 
@@ -20,11 +181,11 @@ this. PostgreSQL integration tests run in Testcontainers and check it.
 - **No double booking**: `@Version` optimistic locking on seats (hold races) and on holds
   (confirm vs. expiry), plus `UNIQUE(booking.hold_id)` and `CHECK` constraints as a database-level
   backstop. Mutation checks show which of these the tests depend on (see Results). A 409
-  `seat-unavailable` lists only the seats that are really taken, even when the request lost a race
-  at write time (the service rolls back, then re-reads the seats in a fresh transaction)
-- **Idempotency-Key** header on every POST: the first response is stored in PostgreSQL and replayed
-  for retries. A reused key with a different body gets 422, and a key that is still in flight gets
-  409 with `Retry-After`. A claim older than 30 s whose response was never recorded gets 409
+  `seat-unavailable` re-reads the taken seats after rollback when the request lost a write race.
+  If the winner has already released all of them before that read, it reports the requested seats
+- **Idempotency-Key** header supported on every POST: when supplied, the first response is stored
+  in PostgreSQL and replayed for retries. A reused key with a different body gets 422, and a key
+  that is still in flight gets 409 with `Retry-After`. A claim older than 30 s whose response was never recorded gets 409
   without `Retry-After`, so clients do not retry it in a loop. Keyed bodies are capped at 64 KB (413)
 - **Hold expiry**: a `@Scheduled` sweeper releases seats of expired holds, one transaction per hold.
   A hold that fails to expire is logged, counted and retried on the next run. Due holds are paged
@@ -43,38 +204,7 @@ this. PostgreSQL integration tests run in Testcontainers and check it.
   `docker-compose.yml` with app + PostgreSQL, GitHub Actions CI (lint, unit + Testcontainers
   integration tests, coverage report, Docker build + smoke test)
 
-## Quick start
-
-Requirements: Java 21 and Docker. The Maven wrapper downloads Maven 3.9.11.
-
-```bash
-# Everything in containers (app + PostgreSQL), then open http://localhost:8080/swagger-ui.html
-docker compose up --build
-
-# Or: PostgreSQL in Docker, app from source (the `local` profile supplies dev credentials)
-docker compose up -d postgres
-./mvnw spring-boot:run -Dspring-boot.run.profiles=local
-
-# Run the end-to-end smoke test (create event, hold twice with one Idempotency-Key, conflict,
-# confirm, availability, metrics)
-./scripts/smoke-test.sh http://localhost:8080
-```
-
-Example calls:
-
-```bash
-curl -X POST localhost:8080/api/v1/events -H 'Content-Type: application/json' -d '{
-  "name": "Jazz Night", "venue": "Main Hall", "startsAt": "2030-01-15T19:30:00Z",
-  "sections": [{"name": "FLOOR", "rows": 10, "seatsPerRow": 20, "priceCents": 5000}]}'
-
-curl 'localhost:8080/api/v1/events/{eventId}/seats?status=AVAILABLE&page=0&size=50'
-
-curl -X POST localhost:8080/api/v1/events/{eventId}/holds \
-  -H 'Content-Type: application/json' -H 'Idempotency-Key: 7f9c...' \
-  -d '{"seatIds": ["<seat-uuid>"], "customerRef": "cust-42"}'
-
-curl -X POST localhost:8080/api/v1/holds/{holdId}/confirm -H 'Idempotency-Key: 1b2d...'
-```
+## Configuration
 
 Configuration (`application.yml`, overridable with environment variables such as
 `SEATS_HOLDTTL=PT2M`): `seats.hold-ttl`, `seats.max-seats-per-hold`, `seats.expiry-sweep-interval`,
@@ -86,45 +216,26 @@ booking is cancelled and its seats are held by someone else, `GET /bookings/{id}
 `CANCELLED` booking whose seats are `HELD`. The booking's own `status` is the record of what
 happened to it.
 
-## Architecture
-
-```mermaid
-flowchart LR
-  C[HTTP client] --> F[IdempotencyFilter<br/>POST + Idempotency-Key]
-  F --> W[Controllers<br/>EventController / ReservationController]
-  W --> S[Services<br/>EventService / ReservationService]
-  S --> D[Domain entities<br/>Event, Seat, Hold, Booking<br/>state transitions + @Version]
-  S --> R[Spring Data JPA repositories]
-  F --> I[(idempotency_record)]
-  R --> P[(PostgreSQL<br/>Flyway schema)]
-  J[HoldExpiryJob<br/>@Scheduled] --> S
-  W -. errors .-> E[ApiExceptionHandler<br/>RFC 7807 problem+json]
-  A[Actuator + Micrometer] -. /actuator/prometheus .-> M[Prometheus]
-```
-
-```
-src/main/java/dev/seatlock/
-  domain/        entities + state machines (Seat, Hold, Booking, Event), SeatMapLayout, exceptions
-  repository/    Spring Data JPA interfaces (+ a JPQL availability aggregate, a Specification filter)
-  service/       EventService, ReservationService (transactions), HoldExpiryJob, metrics
-  web/           controllers, request/response records, ApiExceptionHandler (problem+json)
-  idempotency/   IdempotencyFilter, JDBC store (INSERT ... ON CONFLICT DO NOTHING), cleanup job
-  config/        typed properties (seats.*), Clock, scheduling switch, OpenAPI metadata
-src/main/resources/db/migration/   V1 schema, V2 (drop a redundant index, CHECK on booking totals)
-```
-
-Seat lifecycle: `AVAILABLE -> HELD -> BOOKED`, back to `AVAILABLE` on release, expiry or
-cancellation. Hold lifecycle: `ACTIVE -> CONFIRMED | RELEASED | EXPIRED`.
-
-Design rationale, alternatives and known gaps are in [DESIGN.md](DESIGN.md).
-
 ## Testing
+
+To run from source with Java 21, stop the containerized app if it is running, then start PostgreSQL
+and use the local profile (development credentials only):
+
+```bash
+docker compose stop app
+docker compose up --detach --wait postgres
+./mvnw spring-boot:run -Dspring-boot.run.profiles=local
+```
 
 ```bash
 ./mvnw test             # 97 unit + MockMvc slice test cases, no Docker needed
 ./mvnw verify           # + 27 integration tests on PostgreSQL 16 via Testcontainers, JaCoCo report
 ./mvnw spotless:check   # formatting/lint gate (google-java-format)
 ```
+
+Testcontainers must be able to reach Docker independently of the CLI's selected context. On
+Colima, set `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock` and
+`TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock` in the shell running `verify`.
 
 - **Unit**: seat/hold/booking state machines, seat-map generation, `ReservationService` with
   Mockito (including a simulated lost optimistic-lock race, event-start rules and cancellation),
@@ -172,8 +283,9 @@ about 2x between runs in the shared container.
 
 ## Limitations
 
-- Validated, never deployed; no real users or production traffic. GitHub Actions CI is defined
-  but has not run on GitHub yet (the repository has not been pushed). There is no deployment (CD) stage
+- Validated, never deployed; no real users or production traffic. CI builds, tests and runs a
+  container smoke test; the badge links to hosted workflow status. This local recheck did not
+  query or trigger GitHub Actions. There is no deployment (CD) stage
 - No authentication or ownership checks. `customerRef` is an opaque, self-asserted client string,
   so anyone who knows a hold or booking id (random UUIDs, effectively bearer tokens) can confirm,
   release or cancel it. Idempotency-Keys are global rather than scoped per client/API key, so two
@@ -184,10 +296,10 @@ about 2x between runs in the shared container.
   booking itself is safe
 - Seats whose hold has expired show as `HELD` until the next sweep (default every 5 s). They
   cannot be confirmed in that window, but they cannot be re-held either
-- Only one application instance was ever run. Running several against one database should be
-  safe because every write is version-checked in PostgreSQL, but that is argued, not tested.
-  Expiry would also run on every instance, which is redundant work. A lock such as ShedLock
-  would make it single-runner
+- A bounded two-instance check passed for contested holds and parallel confirms against one
+  database ([recorded Mac checks](VERIFICATION.md#recorded-mac-checks-2026-10-02)). Multi-instance
+  expiry, idempotency, restart and failover remain untested. Expiry runs on every instance,
+  which is redundant work; a lock such as ShedLock would make it single-runner
 - Optimistic locking suits this workload, where most requests touch different seats. A flash sale
   where thousands of clients want one seat would get many 409s. See [DESIGN.md](DESIGN.md) for alternatives
 - Single Spring Boot service with one PostgreSQL database; not microservices or a distributed

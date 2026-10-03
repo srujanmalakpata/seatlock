@@ -54,6 +54,8 @@ the rollback it opens a short read-only transaction and reports the requested se
 AVAILABLE now. Because T2's UPDATE waited for T1's commit, that read sees T1's hold.
 `ConcurrencyIT.conflictsNameOnlyTheSeatsThatAreTaken` races 50 requests for a contested seat
 plus a free seat; a mutation that reports every requested seat fails this test.
+If the winner releases every requested seat before the fresh read, the service falls back to
+listing the requested seats so the lost-race 409 still names seats; that list is not a snapshot.
 
 `ConcurrencyIT` fires 50 simultaneous holds at one seat and asserts 1 x 201 and 49 x 409. As a
 mutation check, the `@Version` annotation was removed from `Seat` and the field initialised to `0L`
@@ -170,7 +172,8 @@ adding authentication.
   run handles at most 20 batches; the next run starts from the oldest due hold again.
 - Multiple instances may run the sweeper at once. Safety is expected because every write
   is version-checked. That is argued from the locking above and from the single-instance race
-  tests; no test runs two application instances. It is also redundant work. Next step: ShedLock or
+  tests; the recorded two-instance hold/confirm checks did not exercise competing sweepers.
+  It is also redundant work. Next step: ShedLock or
   `SELECT ... FOR UPDATE SKIP LOCKED` to split the work.
 - Time comes from an injected `Clock`, so tests move time forward with `MutableClock` instead of
   sleeping.
